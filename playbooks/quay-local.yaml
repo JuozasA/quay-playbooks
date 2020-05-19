@@ -8,6 +8,7 @@
 #
 - hosts: localhost
   vars:
+    ansible_python_interpreter: /usr/bin/python3
     quay_host: thomasmckay.usersys.redhat.com
     quay_ip: 192.168.1.119
     quay_image: quay.io/redhat/quay:v3.1.2
@@ -61,6 +62,7 @@
         - quay-storage/minio
         - openldap/config
         - openldap/database
+        - openldap/certs
         - quay-config
         - clair-config
         - quay-builder/certs
@@ -270,6 +272,7 @@
       with_items:
         - openldap/config
         - openldap/database
+        - openldap/certs
 
     # To communicate with this server, the ip address needs to be used in config
     #   docker inspect -f "{{ .NetworkSettings.IPAddress }}" quay-openldap
@@ -285,15 +288,19 @@
           LDAP_ORGANISATION: acmecorp
           LDAP_DOMAIN: acmecorp.com
           LDAP_BASE_DN: "dc=acmecorp,dc=com"
+          LDAP_TLS_VERIFY_CLIENT: try
         volumes:
           - "{{ volumes_dir }}/openldap/config:/etc/ldap/slapd.d"
           - "{{ volumes_dir }}/openldap/database:/var/lib/ldap"
+          - "{{ volumes_dir }}/openldap/certs:/tmp/certs"
         ports:
-          - "389:389"
+          - "3389:389"
+          - "6636:636"
         keep_volumes: true
         auto_remove: true
         state: started
         restart: true
+        hostname: thomasmckay.usersys.redhat.com
         etc_hosts:
           # This does not expand the hostname that lands in /etc/hosts
           # "{{ quay_host }}": "{{ quay_ip }}"
@@ -302,6 +309,14 @@
       until: result is succeeded
       retries: 5
       delay: 10
+
+    - name: Install Openldap Cert
+      tags: [restart-openldap]
+      shell:
+        cmd: |
+           docker exec quay-openldap bash -c "cp /container/service/slapd/assets/certs/ca.crt /tmp/certs/openldap.crt"
+           sudo cp openldap/certs/openldap.crt /etc/pki/ca-trust/source/anchors/openldap.crt
+           sudo update-ca-trust extract
 
     # Helper:
     #   alias qdappasswd="docker exec quay-openldap ldappasswd -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme "
