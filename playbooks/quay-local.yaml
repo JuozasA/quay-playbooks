@@ -26,7 +26,7 @@
       ignore_errors: true
       shell:
         cmd: |
-          docker kill quay-postgresql quay-redis quay-config quay clair grafana prometheus swagger quay-minio
+          docker kill quay-postgresql quay-postgresql-slave quay-redis quay-config quay clair grafana prometheus swagger quay-minio
     - name: Stop docker processes
       tags: [redeploy-clair]
       ignore_errors: true
@@ -42,6 +42,7 @@
       with_items:
         - quay-redis
         - quay-postgresql
+        - quay-postgresql-slave
         - quay-storage
         - quay-config
         - clair-config
@@ -58,12 +59,14 @@
       with_items:
         - quay-redis
         - quay-postgresql
+        - quay-postgresql-slave
         - quay-storage/local
         - quay-storage/minio
         - openldap/config
         - openldap/database
         - openldap/certs
         - quay-config
+        - quay-config/extra_ca_certs
         - clair-config
         - quay-builder/certs
         - certs
@@ -113,6 +116,7 @@
           sudo update-ca-trust extract
           sudo systemctl restart docker.service
 
+    #  psql "postgres://quay:quay@thomasmckay.usersys.redhat.com:5432/quay"
     - name: Quay Postgresql container
       tags: [start-setup, restart-all, restart-postgresql]
       docker_container:
@@ -125,6 +129,9 @@
           POSTGRESQL_USER: quay
           POSTGRESQL_PASSWORD: quay
           POSTGRESQL_DATABASE: quay
+          POSTGRESQL_REPLICATION_MODE: master
+          POSTGRESQL_REPLICATION_USER: quay
+          POSTGRESQL_REPLICATION_PASSWORD: quay
         ports:
           - "5432:5432"
         keep_volumes: true
@@ -142,6 +149,42 @@
       shell:
         cmd: |
           docker exec quay-postgresql bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
+      register: result
+      until: result is succeeded
+      retries: 5
+      delay: 10
+
+    - name: Quay Postgresql Slave container
+      tags: [start-setup, restart-all, restart-postgresql-slave]
+      docker_container:
+        name: quay-postgresql-slave
+        image: registry.redhat.io/rhscl/postgresql-96-rhel7:latest
+        volumes:
+          - "{{ volumes_dir }}/quay-postgresql-slave:/var/lib/postgresql/data/pgdata:Z"
+          #- "{{ volumes_dir }}/quay-postgresql-slave:/var/lib/pgsql/data/userdata:Z"
+        env:
+          POSTGRESQL_MASTER_HOST: "{{ quay_host }}"
+          POSTGRESQL_MASTER_PORT_NUMBER: "5432"
+          POSTGRESQL_REPLICATION_MODE: slave
+          POSTGRESQL_REPLICATION_USER: quay
+          POSTGRESQL_REPLICATION_PASSWORD: quay
+        ports:
+          - "5433:5432"
+        keep_volumes: true
+        auto_remove: true
+        state: started
+        restart: true
+        etc_hosts:
+          # This does not expand the hostname that lands in /etc/hosts
+          # "{{ quay_host }}": "{{ quay_ip }}"
+          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
+
+    - name: Postgresql add pg_trgm extension
+      tags: [start-setup, restart-all, XXXXXrestart-postgresql-slave]
+      shell:
+        cmd: |
+          docker exec quay-postgresql-slave bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
       register: result
       until: result is succeeded
       retries: 5
@@ -250,14 +293,14 @@
           aws --endpoint-url http://{{ quay_host }}:9000 --no-verify-ssl s3 mb s3://quay-bucket-2
 
     - name: Stop OpenLDAP containers
-      tags: [restart-openldap]
+      tags: [start-setup, restart-openldap]
       ignore_errors: true
       shell:
         cmd: |
           docker kill quay-openldap
 
     - name: Remove prior OpenLDAP data and volume folders
-      tags: [restart-openldap]
+      tags: [start-setup, restart-openldap]
       command: "sudo rm -Rf {{ volumes_dir }}/{{ item }}"
       args:
         removes: "{{ volumes_dir }}/{{ item }}"
@@ -265,7 +308,7 @@
         - openldap
 
     - name: Create OpenLDAP volume folders
-      tags: [restart-openldap]
+      tags: [start-setup, restart-openldap]
       file:
         path: "{{ volumes_dir }}/{{ item }}"
         state: directory
@@ -279,7 +322,7 @@
     # Not sure why
     - name: OpenLDAP container
       # No start-setup tag until working
-      tags: [restart-openldap]
+      tags: [start-setup, restart-openldap]
       docker_container:
         name: quay-openldap
         image: osixia/openldap:1.3.0
@@ -311,12 +354,13 @@
       delay: 10
 
     - name: Install Openldap Cert
-      tags: [restart-openldap]
+      tags: [start-setup, restart-openldap]
       shell:
         cmd: |
            docker exec quay-openldap bash -c "cp /container/service/slapd/assets/certs/ca.crt /tmp/certs/openldap.crt"
-           sudo cp openldap/certs/openldap.crt /etc/pki/ca-trust/source/anchors/openldap.crt
+           sudo cp {{ volumes_dir}}/openldap/certs/openldap.crt /etc/pki/ca-trust/source/anchors/openldap.crt
            sudo update-ca-trust extract
+           cp {{ volumes_dir}}/openldap/certs/openldap.crt {{ volumes_dir}}/quay-config/extra_ca_certs/openldap.crt
 
     # Helper:
     #   alias qdappasswd="docker exec quay-openldap ldappasswd -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme "
@@ -329,7 +373,7 @@
     # Searches:
     #   quayldap -b dc=acmecorp,dc=com "(&(objectCategory=users)(memberOf=cn=group2,ou=groups,dc=acmecorp,dc=com))"
     - name: Initialize OpenLDAP
-      tags: [setup-openldap]
+      tags: [start-setup, setup-openldap]
       shell:
         cmd: |
           sudo chmod -R a+rwx {{ volumes_dir }}/openldap
@@ -385,7 +429,7 @@
           docker exec quay-openldap ldapadd -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme -f /etc/ldap/slapd.d/setup-openldap.ldif
 
     - name: Pull latest image
-      tags: [start-setup, repull-quay]
+      tags: [repull-quay]
       ignore_errors: true
       shell:
         cmd: |
