@@ -10,29 +10,42 @@
   vars:
     ansible_python_interpreter: /usr/bin/python3
     quay_host: thomasmckay.usersys.redhat.com
-    quay_ip: 192.168.1.119
-    quay_image: quay.io/redhat/quay:v3.1.2
-    clair_image: quay.io/redhat/clair-jwt:v3.1.2
-    builder_image: quay.io/redhat/quay-builder:v3.1.2
+    quay_ip: 192.168.1.143
+    quay_image: quay.io/thomasmckay/quay:devel
+    clair_image: quay.io/projectquay/clair:qui-gon
+    builder_image: quay.io/projectquay/quay-builder:qui-gon
     roles_dir: ../roles
     volumes_dir: /home/thomasmckay/quay-volumes
     downloads_dir: /home/thomasmckay/Downloads
     quay_http_port: 8080
     quay_https_port: 8443
 
+  gather_facts: no
+
   tasks:
-    - name: Stop docker processes
+    - name: Stop podman processes
       tags: [teardown, start-setup]
       ignore_errors: true
       shell:
         cmd: |
-          docker kill quay-postgresql quay-postgresql-slave quay-redis quay-config quay clair grafana prometheus swagger quay-minio
-    - name: Stop docker processes
+          podman kill {{ item }}
+      with_items:
+        - quay-postgresql
+        - quay-postgresql-replica
+        - quay-redis quay-config
+        - quay
+        - clair
+        - grafana
+        - prometheus
+        - swagger
+        - quay-minio
+        - quay-openldap
+    - name: Stop podman processes
       tags: [redeploy-clair]
       ignore_errors: true
       shell:
         cmd: |
-          docker kill clair
+          podman kill clair
 
     - name: Remove prior data and volume folders
       tags: [teardown, start-setup]
@@ -42,7 +55,7 @@
       with_items:
         - quay-redis
         - quay-postgresql
-        - quay-postgresql-slave
+        - quay-postgresql-replica
         - quay-storage
         - quay-config
         - clair-config
@@ -56,10 +69,11 @@
       file:
         path: "{{ volumes_dir }}/{{ item }}"
         state: directory
+        mode: "a+rwx"
       with_items:
         - quay-redis
         - quay-postgresql
-        - quay-postgresql-slave
+        - quay-postgresql-replica
         - quay-storage/local
         - quay-storage/minio
         - openldap/config
@@ -108,18 +122,17 @@
               -CA {{ volumes_dir }}/certs/rootCA.crt -CAkey {{ volumes_dir }}/certs/rootCA.key \
               -CAcreateserial -extensions v3_req -extfile /etc/pki/tls/openssl.cnf
 
-    - name: Install rootCA and restart docker.service
+    - name: Install rootCA
       tags: [start-setup]
       shell:
         cmd: |
           sudo cp {{ volumes_dir }}/certs/rootCA.crt /etc/pki/ca-trust/source/anchors
           sudo update-ca-trust extract
-          sudo systemctl restart docker.service
 
     #  psql "postgres://quay:quay@thomasmckay.usersys.redhat.com:5432/quay"
     - name: Quay Postgresql container
       tags: [start-setup, restart-all, restart-postgresql]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-postgresql
         image: registry.redhat.io/rhscl/postgresql-96-rhel7:latest
         volumes:
@@ -134,57 +147,59 @@
           POSTGRESQL_REPLICATION_PASSWORD: quay
         ports:
           - "5432:5432"
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
+        rm: true
         state: started
         restart: true
         etc_hosts:
           # This does not expand the hostname that lands in /etc/hosts
           # "{{ quay_host }}": "{{ quay_ip }}"
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
 
     - name: Postgresql add pg_trgm extension
       tags: [start-setup, restart-all, restart-postgresql]
       shell:
         cmd: |
-          docker exec quay-postgresql bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
+          podman exec quay-postgresql bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
       register: result
       until: result is succeeded
       retries: 5
       delay: 10
 
-    - name: Quay Postgresql Slave container
-      tags: [start-setup, restart-all, restart-postgresql-slave]
-      docker_container:
-        name: quay-postgresql-slave
+    - name: Quay Postgresql Replica container
+      tags: [restart-postgresql-replica]
+      containers.podman.podman_container:
+        name: quay-postgresql-replica
         image: registry.redhat.io/rhscl/postgresql-96-rhel7:latest
         volumes:
-          - "{{ volumes_dir }}/quay-postgresql-slave:/var/lib/postgresql/data/pgdata:Z"
-          #- "{{ volumes_dir }}/quay-postgresql-slave:/var/lib/pgsql/data/userdata:Z"
+          - "{{ volumes_dir }}/quay-postgresql-replica:/var/lib/postgresql/data/pgdata:Z"
+          #- "{{ volumes_dir }}/quay-postgresql-replica:/var/lib/pgsql/data/userdata:Z"
         env:
           POSTGRESQL_MASTER_HOST: "{{ quay_host }}"
           POSTGRESQL_MASTER_PORT_NUMBER: "5432"
-          POSTGRESQL_REPLICATION_MODE: slave
+          POSTGRESQL_REPLICATION_MODE: replica
           POSTGRESQL_REPLICATION_USER: quay
           POSTGRESQL_REPLICATION_PASSWORD: quay
         ports:
           - "5433:5432"
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
+        rm: true
         state: started
         restart: true
         etc_hosts:
           # This does not expand the hostname that lands in /etc/hosts
           # "{{ quay_host }}": "{{ quay_ip }}"
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
 
     - name: Postgresql add pg_trgm extension
-      tags: [start-setup, restart-all, XXXXXrestart-postgresql-slave]
+      tags: [restart-postgresql-replica]
       shell:
         cmd: |
-          docker exec quay-postgresql-slave bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
+          podman exec quay-postgresql-replica bash -l -c 'echo "CREATE EXTENSION pg_trgm" | psql quay'
       register: result
       until: result is succeeded
       retries: 5
@@ -192,7 +207,7 @@
 
     - name: Quay Redis container
       tags: [start-setup, restart-all, restart-redis]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-redis
         image: registry.redhat.io/rhscl/redis-32-rhel7:latest
         volumes:
@@ -200,10 +215,11 @@
         ports:
           - "6379:6379"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
+        rm: true
         state: started
 
     - name: Create prometheus.yml
@@ -224,7 +240,7 @@
 
     - name: Prometheus container
       tags: [finish-setup, restart-all, restart-prometheus, redeploy-prometheus]
-      docker_container:
+      containers.podman.podman_container:
         name: prometheus
         image: registry.redhat.io/openshift3/prometheus:v3.11
         volumes:
@@ -232,16 +248,17 @@
         ports:
           - "8555:9090"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
+        rm: true
         state: started
         restart: true
 
     - name: Grafana container
       tags: [finish-setup, restart-all, redeploy-prometheus, redeploy-grafana]
-      docker_container:
+      containers.podman.podman_container:
         name: grafana
         image: registry.redhat.io/openshift3/grafana:v3.11
         user: "0:0"
@@ -250,10 +267,11 @@
         ports:
           - "8666:3000"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
+        rm: true
         state: started
         restart: true
 
@@ -266,18 +284,17 @@
     #
     - name: "MinIO container"
       tags: [start-setup, restart-minio, restart-all]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-minio
         image: minio/minio
         command:
           - server
           - /data
         volumes:
-          - "{{ volumes_dir }}/quay-storage/minio:/data"
+          - "{{ volumes_dir }}/quay-storage/minio:/data:Z"
         ports:
           - "9000:9000"
-        keep_volumes: true
-        auto_remove: true
+        rm: true
         state: started
         restart: true
       register: result
@@ -297,7 +314,7 @@
       ignore_errors: true
       shell:
         cmd: |
-          docker kill quay-openldap
+          podman kill quay-openldap
 
     - name: Remove prior OpenLDAP data and volume folders
       tags: [start-setup, restart-openldap]
@@ -318,12 +335,12 @@
         - openldap/certs
 
     # To communicate with this server, the ip address needs to be used in config
-    #   docker inspect -f "{{ .NetworkSettings.IPAddress }}" quay-openldap
+    #   podman inspect -f "{{ .NetworkSettings.IPAddress }}" quay-openldap
     # Not sure why
     - name: OpenLDAP container
       # No start-setup tag until working
       tags: [start-setup, restart-openldap]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-openldap
         image: osixia/openldap:1.3.0
         env:
@@ -333,21 +350,20 @@
           LDAP_BASE_DN: "dc=acmecorp,dc=com"
           LDAP_TLS_VERIFY_CLIENT: try
         volumes:
-          - "{{ volumes_dir }}/openldap/config:/etc/ldap/slapd.d"
-          - "{{ volumes_dir }}/openldap/database:/var/lib/ldap"
-          - "{{ volumes_dir }}/openldap/certs:/tmp/certs"
+          - "{{ volumes_dir }}/openldap/config:/etc/ldap/slapd.d:Z"
+          - "{{ volumes_dir }}/openldap/database:/var/lib/ldap:Z"
+          - "{{ volumes_dir }}/openldap/certs:/tmp/certs:Z"
         ports:
           - "3389:389"
           - "6636:636"
-        keep_volumes: true
-        auto_remove: true
+        rm: true
         state: started
         restart: true
         hostname: thomasmckay.usersys.redhat.com
         etc_hosts:
           # This does not expand the hostname that lands in /etc/hosts
           # "{{ quay_host }}": "{{ quay_ip }}"
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
       register: result
       until: result is succeeded
       retries: 5
@@ -357,7 +373,7 @@
       tags: [start-setup, restart-openldap]
       shell:
         cmd: |
-           docker exec quay-openldap bash -c "cp /container/service/slapd/assets/certs/ca.crt /tmp/certs/openldap.crt"
+           podman exec quay-openldap bash -c "cp /container/service/slapd/assets/certs/ca.crt /tmp/certs/openldap.crt"
            sudo cp {{ volumes_dir}}/openldap/certs/openldap.crt /etc/pki/ca-trust/source/anchors/openldap.crt
            sudo update-ca-trust extract
            cp {{ volumes_dir}}/openldap/certs/openldap.crt {{ volumes_dir}}/quay-config/extra_ca_certs/openldap.crt
@@ -369,9 +385,11 @@
     #   alias qdapsearch="docker exec quay-openldap ldapsearch -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme "
     # Passwords:
     #   quayldap uid=john,ou=users,dc=acmecorp,dc=com
-    #   docker exec -it quay-openldap slappasswd -h {SSHA}
+    #   podman exec -it quay-openldap slappasswd -h {SSHA}
     # Searches:
     #   quayldap -b dc=acmecorp,dc=com "(&(objectCategory=users)(memberOf=cn=group2,ou=groups,dc=acmecorp,dc=com))"
+    #
+    # LDAPTLS_CACERT=/home/thomasmckay/quay-volumes/openldap/certs/openldap.crt ldapsearch -H ldaps://thomasmckay.usersys.redhat.com:6636 -D cn=admin,dc=acmecorp,dc=com -w changeme -b dc=acmecorp,dc=com
     - name: Initialize OpenLDAP
       tags: [start-setup, setup-openldap]
       shell:
@@ -398,8 +416,8 @@
           objectClass: inetOrgPerson
           loginShell: /bin/bash
           homeDirectory: /home/billy
-          uidNumber: 14583102
-          gidNumber: 14564100
+          uidNumber: 14383102
+          gidNumber: 14364100
           userPassword: {SSHA}QVzVRrrhgApHMmSehx6ItRA30URKJ1I6
           mail: billy@acmecorp.com
           gecos: Billy User
@@ -413,8 +431,8 @@
           objectClass: inetOrgPerson
           loginShell: /bin/bash
           homeDirectory: /home/john
-          uidNumber: 14583103
-          gidNumber: 14564101
+          uidNumber: 14383103
+          gidNumber: 14364101
           userPassword: {SSHA}QVzVRrrhgApHMmSehx6ItRA30URKJ1I6
           mail: john@acmecorp.com
           gecos: John User
@@ -426,24 +444,24 @@
           uniqueMember: uid=admin,dc=acmecorp,dc=com
           uniqueMember: uid=john,ou=Users,dc=acmecorp,dc=com
           EOF
-          docker exec quay-openldap ldapadd -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme -f /etc/ldap/slapd.d/setup-openldap.ldif
+          podman exec quay-openldap ldapadd -x -H ldap://localhost -D cn=admin,dc=acmecorp,dc=com -w changeme -f /etc/ldap/slapd.d/setup-openldap.ldif
 
     - name: Pull latest image
       tags: [repull-quay]
       ignore_errors: true
       shell:
         cmd: |
-          docker pull {{ quay_image }}
+          podman pull {{ quay_image }}
 
     - name: Quay Config container
       tags: [start-setup, restart-config]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-config
         image: "{{ quay_image }}"
         volumes:
-          - "{{ volumes_dir }}/quay-config:/conf/stack"
-          - "{{ volumes_dir }}/quay-storage/local:/datastorage"
-          - "/home/thomasmckay/code/quay-devel:/home/thomasmckay/code/quay-devel"
+          - "{{ volumes_dir }}/quay-config:/conf/stack:Z"
+          - "{{ volumes_dir }}/quay-storage/local:/datastorage:Z"
+          - "/home/thomasmckay/code/quay-devel:/home/thomasmckay/code/quay-devel:Z"
         env:
           QUAYENTRY: config
           CONFIG_APP_PASSWORD: password
@@ -451,10 +469,9 @@
           - "9080:8080"
           - "9443:8443"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        keep_volumes: true
-        auto_remove: true
+        rm: true
         state: started
         restart: true
       register: result
@@ -481,21 +498,26 @@
         regexp: "^BROWSER_API_CALLS_XHR_ONLY:"
         line: "BROWSER_API_CALLS_XHR_ONLY: false"
 
+    - name: Add read permission to all data and volume folders
+      tags: [teardown, start-setup]
+      command: "sudo chmod -R a+r {{ volumes_dir }}"
+
     - name: Pull latest image
       tags: [pull-latest, repull-quay]
       shell:
         cmd: |
-          docker pull {{ quay_image }}
+          podman pull {{ quay_image }}
 
+    # podman run --rm -it -v /home/thomasmckay/quay-volumes/quay-config:/conf/stack:Z -v /home/thomasmckay/quay-volumes/quay-storage:/datastorage:Z -p 8443:8443 -p 8080:8080 --network=host quay.io/thomasmckay/quay:pr533 shell
     - name: Quay Registry container
       tags: [finish-setup, restart-quay, restart-all]
-      docker_container:
+      containers.podman.podman_container:
         name: quay
         image:  "{{ quay_image }}"
         volumes:
-          - "{{ volumes_dir }}/quay-config:/conf/stack"
-          - "{{ volumes_dir }}/quay-storage/local:/datastorage"
-          - "/home/thomasmckay/code/quay-devel:/home/thomasmckay/code/quay-devel"
+          - "{{ volumes_dir }}/quay-config:/conf/stack:Z"
+          - "{{ volumes_dir }}/quay-storage/local:/datastorage:Z"
+          - "/home/thomasmckay/code/quay-devel:/home/thomasmckay/code/quay-devel:Z"
         env:
           QUAYENTRY: registry
           DEBUGLOG: "true"
@@ -510,11 +532,10 @@
           - "2345:2345"
           - "2346:2346"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        network_mode: host
-        keep_volumes: true
-        auto_remove: true
+        network: host
+        rm: true
         state: started
         restart: true
       register: result
@@ -530,10 +551,10 @@
 
 
     - name: Quay Builder container
-      tags: [finish-setup, restart-quay, restart-all, restart-builder]
-      docker_container:
+      tags: [TODOfinish-setup, restart-all, restart-builder]
+      containers.podman.podman_container:
         name: quay-builder
-        image:  quay-builder:v3.2.0-3
+        image:  quay.io/redhat/quay-builder:v3.3.0
         user: "0:0"
         volumes:
           - "/var/run/docker.sock:/var/run/docker.sock"
@@ -541,11 +562,11 @@
         env:
           SERVER: "ws://{{ quay_host }}:8787"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
         network_mode: host
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
         state: started
         restart: true
       register: result
@@ -555,7 +576,7 @@
 
     - name: Quay Registry 3.2 container
       tags: [quay-3.2]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-3.2
         image:  quay.io/redhat/quay:v3.2.1
         volumes:
@@ -570,11 +591,11 @@
           - "{{ quay_http_port }}:7080"
           - "{{ quay_https_port }}:7443"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
         network_mode: host
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
         state: started
         restart: true
       register: result
@@ -584,7 +605,7 @@
 
     - name: Quay Mirror container
       tags: [restart-mirror]
-      docker_container:
+      containers.podman.podman_container:
         name: quay-mirror
         image: "{{ quay_image }}"
         volumes:
@@ -598,10 +619,10 @@
           - "9980:8080"
           - "9943:8443"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        keep_volumes: true
-        auto_remove: true
+        #keep_volumes: true
+        #auto_remove: true
         state: started
         restart: true
       register: result
@@ -613,7 +634,7 @@
       tags: [finish-setup, redeploy-clair]
       shell:
         cmd: |
-          docker exec quay-postgresql bash -l -c 'echo "select kid,service from servicekey;" | psql quay' | grep security_scanner | awk '{print $1}'
+          podman exec quay-postgresql bash -l -c 'echo "select kid,service from servicekey;" | psql quay' | grep security_scanner | awk '{print $1}'
       register: key_id
 
     - name: Put security_scanner.pem in place
@@ -622,8 +643,49 @@
         cmd: |
           cp {{ volumes_dir }}/quay-config/security_scanner.pem {{ volumes_dir }}/clair-config/
 
+    # https://github.com/quay/clair/blob/development-4.0/config.yaml.sample
     - name: Create clair.yaml
       tags: [finish-setup, redeploy-clair]
+      vars:
+        quay_endpoint: "{{ quay_host }}:8443"
+        clair_endpoint: "{{ quay_host }}"
+      shell:
+        cmd: |
+          cp {{ volumes_dir }}/certs/rootCA.crt {{ volumes_dir }}/clair-certs/rootCA.crt
+          cp {{ volumes_dir }}/quay-config/security_scanner.pem {{ volumes_dir }}/clair-config/security_scanner.pem
+          cp {{ volumes_dir }}/certs/clair.crt {{ volumes_dir }}/clair-config
+          cp {{ volumes_dir }}/certs/clair.key {{ volumes_dir }}/clair-config
+          cat <<EOF > {{ volumes_dir }}/clair-config/config.yaml
+          introspection_addr: {{ quay_host }}:8089
+          http_listen_addr: {{ quay_host }}:8080
+          log_level: debug
+          indexer:
+            connstring: "host={{ quay_host }} port=5432 user=clair dbname=clair sslmode=disable"
+            scanlock_retry: 10
+            layer_scan_concurrency: 5
+            migrations: true
+          matcher:
+            indexer_addr: "{{ quay_host }}:8080"
+            connstring: "host={{ quay_host }} port=5432 user=clair dbname=clair sslmode=disable"
+            max_conn_pool: 100
+            run: ""
+            migrations: true
+            updater_sets:
+          	- "alpine"
+          	- "aws"
+          	- "debian"
+          	- "oracle"
+          	- "photon"
+          	- "pyupio"
+          	- "rhel"
+          	- "suse"
+          	- "ubuntu"
+          metrics:
+            name: "prometheus"
+          EOF
+
+    - name: Create clair-jwt yaml
+      tags: [redeploy-clair-jwt]
       vars:
         quay_endpoint: "{{ quay_host }}:8443"
         clair_endpoint: "{{ quay_host }}"
@@ -690,13 +752,13 @@
       tags: [finish-setup, repull-clair]
       shell:
         cmd: |
-          docker pull {{ clair_image }}
+          podman pull {{ clair_image }}
 
     - name: Drop Postgresql 'clair' database
       tags: [finish-setup, redeploy-clair]
       shell:
         cmd: |
-          docker exec quay-postgresql bash -l -c 'dropdb clair'
+          podman exec quay-postgresql bash -l -c 'dropdb clair'
       register: result
       ignore_errors: yes
 
@@ -704,13 +766,13 @@
       tags: [finish-setup, redeploy-clair]
       shell:
         cmd: |
-          docker exec quay-postgresql bash -l -c 'createdb clair'
+          podman exec quay-postgresql bash -l -c 'createdb clair'
       register: result
       ignore_errors: yes
 
     - name: Clair container
       tags: [finish-setup, restart-clair, restart-clair, redeploy-clair, restart-all]
-      docker_container:
+      containers.podman.podman_container:
         name: clair
         image: "{{ clair_image }}"
         volumes:
@@ -726,11 +788,9 @@
           - "6061:6061"
           - "6062:6062"
         etc_hosts:
-          thomasmckay.usersys.redhat.com: 192.168.1.119
+          thomasmckay.usersys.redhat.com: 192.168.1.143
           thomasmckay-desktop.usersys.redhat.com: 192.168.1.2
-        network_mode: host
-        keep_volumes: true
-        auto_remove: true
+        rm: true
         state: started
         restart: true
       register: result
@@ -740,15 +800,14 @@
 
     - name: Swagger container
       tags: [finish-setup, restart-all, restart-swagger]
-      docker_container:
+      containers.podman.podman_container:
         name: swagger
         image:  swaggerapi/swagger-ui
         env:
           API_URL: "https://{{ quay_host }}:{{ quay_https_port }}/api/v1/discovery"
         ports:
           - "8888:8080"
-        #network_mode: host
-        auto_remove: true
+        rm: true
         state: started
         restart: true
       register: result
@@ -775,3 +834,13 @@
     - name: "Open browser: Github Apps"
       tags: [finish-setup]
       command: "xdg-open https://github.com/settings/apps/quay-development"
+
+    - name: Setup quay-devel
+      tags: [devel-setup]
+      shell:
+        cmd: |
+          podman exec quay bash -l -c 'cd /quay-registry && supervisorctl -c /quay-registry/conf/supervisord.conf stop gunicorn-web && supervisorctl -c /quay-registry/conf/supervisord.conf stop repomirrorworker'
+          podman exec quay bash -l -c 'cd /quay-registry && mv static static.bak && ln -s /home/thomasmckay/code/quay-devel/static'
+          podman exec quay bash -l -c 'cd /home/thomasmckay/code/quay-devel && mkdir -p static/webfonts && mkdir -p static/fonts && mkdir -p static/ldn && PYTHONPATH=. python -m external_libraries && rm -Rf config_app/static/ldn && cp -r static/ldn config_app/static/ldn && rm -Rf config_app/static/fonts && cp -r static/fonts config_app/static/fonts && rm -Rf config_app/static/webfonts && cp -r static/webfonts config_app/static/webfonts'
+      register: result
+      ignore_errors: no
